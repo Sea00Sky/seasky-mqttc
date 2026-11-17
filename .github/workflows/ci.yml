@@ -1,0 +1,146 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# 这个仓库没有任何密钥要给 workflow 用，权限收到最小
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: linux / ${{ matrix.compiler }} / ${{ matrix.label }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { compiler: gcc,   cc: gcc,   cxx: g++,     sanitize: "",                  label: plain }
+          - { compiler: clang, cc: clang, cxx: clang++, sanitize: "",                  label: plain }
+          - { compiler: gcc,   cc: gcc,   cxx: g++,     sanitize: "address,undefined", label: asan-ubsan }
+          - { compiler: clang, cc: clang, cxx: clang++, sanitize: "address,undefined", label: asan-ubsan }
+          - { compiler: gcc,   cc: gcc,   cxx: g++,     sanitize: "thread",            label: tsan }
+          - { compiler: clang, cc: clang, cxx: clang++, sanitize: "thread",            label: tsan }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 装依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build libssl-dev openssl python3
+
+      - name: 降低 ASLR 熵（TSan 专用）
+        # Ubuntu 24.04 默认 vm.mmap_rnd_bits=32，TSan 的影子内存布局装不下，
+        # 会在跑任何用例之前就以 "FATAL: unexpected memory mapping" 退出（exit 66）。
+        # 这是 runner 环境问题，不是被测代码的问题；本地 WSL 复现过同样现象。
+        if: matrix.sanitize == 'thread'
+        run: sudo sysctl vm.mmap_rnd_bits=28
+
+      - name: "配置（sanitizer: ${{ matrix.sanitize || '无' }}）"
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        # TLS 默认开；e2e 会用 openssl CLI 现场生成自签证书
+        run: >
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
+          -DMQTTC_SANITIZE="${{ matrix.sanitize }}"
+
+      - name: 编译
+        run: cmake --build build
+
+      - name: 测试（含真 socket 的 e2e）
+        run: ctest --test-dir build --output-on-failure
+
+  windows:
+    name: windows / msys2-ucrt64
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-python
+
+      - name: 配置
+        shell: msys2 {0}
+        # Windows 侧的 TLS 传输层尚未实现（需要 MSYS2 + OpenSSL 环境来编写与验证）。
+        # 因此这里显式关掉 TLS，e2e 也不跑 TLS 场景。
+        run: >
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
+          -DMQTTC_ENABLE_TLS=OFF
+
+      - name: 编译
+        shell: msys2 {0}
+        run: cmake --build build
+
+      - name: 测试（含真 socket 的 e2e）
+        shell: msys2 {0}
+        run: ctest --test-dir build --output-on-failure
+
+  fuzzers:
+    name: linux / clang / libFuzzer
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 装依赖
+        # libFuzzer 的运行时随 clang 一起发，包名带版本号（Ubuntu 24.04 是 18）
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build clang libclang-rt-18-dev
+
+      - name: 配置
+        env:
+          CC: clang
+          CXX: clang++
+        run: >
+          cmake -S . -B build-fuzz -G Ninja -DCMAKE_BUILD_TYPE=Debug
+          -DMQTTC_ENABLE_TLS=OFF -DMQTTC_BUILD_TESTS=OFF -DMQTTC_BUILD_CLI=OFF
+          -DMQTTC_BUILD_FUZZERS=ON
+
+      - name: 编译
+        run: cmake --build build-fuzz
+
+      - name: 跑模糊测试（限定时间，只在崩溃时失败）
+        run: |
+          ./build-fuzz/fuzz_decode -max_total_time=30 -print_final_stats=1
+          ./build-fuzz/fuzz_wire   -max_total_time=30 -print_final_stats=1
+
+  coverage:
+    name: linux / gcc / coverage
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 装依赖
+        run: |
+          sudo apt-get update
+          # 24.04 的 python 是 externally-managed，pip install 会被 PEP 668 拒绝；
+          # gcovr 直接用发行版包，少一个失败点。
+          sudo apt-get install -y --no-install-recommends cmake ninja-build gcc g++ libssl-dev openssl python3 gcovr
+
+      - name: 配置（--coverage）
+        run: >
+          cmake -S . -B build-cov -G Ninja -DCMAKE_BUILD_TYPE=Debug
+          -DMQTTC_ENABLE_COVERAGE=ON
+
+      - name: 编译并测试
+        run: |
+          cmake --build build-cov
+          ctest --test-dir build-cov --output-on-failure
+
+      - name: 覆盖率数字（只报实测值，不设阈值）
+        run: gcovr --root . --filter 'src/' --txt --txt-summary build-cov

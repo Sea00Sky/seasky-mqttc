@@ -1,0 +1,13 @@
+@PACKAGE_INIT@
+
+# mqttc 的依赖要跟着一起找出来，消费者才能直接链 mqttc::mqttc
+include(CMakeFindDependencyMacro)
+find_dependency(Threads)
+
+if(@MQTTC_ENABLE_TLS@)
+    find_dependency(OpenSSL)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/mqttcTargets.cmake")
+
+check_required_components(mqttc)

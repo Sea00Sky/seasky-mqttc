@@ -1,0 +1,6 @@
+# 文本统一用 LF，避免在 Windows 上提交时混入 CRLF
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.webp binary
